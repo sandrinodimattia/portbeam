@@ -1,0 +1,24 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  throughput:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run throughput benchmark
+        run: go test -bench=BenchmarkRunForwardsTCPThroughput -benchmem -benchtime=5s -run '^$' .
