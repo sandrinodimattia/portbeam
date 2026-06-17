@@ -39,10 +39,19 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
 
       - name: Race test
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
+
+      - name: Coverage
+        run: |
+          go test -count=1 -coverprofile=coverage.out ./...
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ { print $3 }')"
+          if [ "$total" != "100.0%" ]; then
+            echo "coverage $total, want 100.0%"
+            exit 1
+          fi
 
       - name: Build
         run: go build -trimpath -o "$RUNNER_TEMP/portbeam" ./cmd/portbeam

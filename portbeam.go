@@ -79,6 +79,11 @@ type normalizedOptions struct {
 	logger          *log.Logger
 }
 
+var (
+	listenTCP = net.Listen
+	lookupIP  = net.DefaultResolver.LookupNetIP
+)
+
 // ParseSpec parses a "listen=target" forwarding rule.
 func ParseSpec(value string) (Spec, error) {
 	if strings.Count(value, "=") != 1 {
@@ -143,7 +148,7 @@ func Run(ctx context.Context, specs []Spec, options Options) error {
 
 	listeners := make([]net.Listener, 0, len(resolvedSpecs))
 	for _, spec := range resolvedSpecs {
-		listener, err := net.Listen("tcp", spec.listen)
+		listener, err := listenTCP("tcp", spec.listen)
 		if err != nil {
 			closeListeners(listeners)
 			return fmt.Errorf("listen on %s: %w", spec.listen, err)
@@ -260,7 +265,7 @@ func resolveTCPAddrPorts(ctx context.Context, address string) ([]netip.AddrPort,
 		return []netip.AddrPort{netip.AddrPortFrom(addr.Unmap(), targetPort)}, nil
 	}
 
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	addrs, err := lookupIP(ctx, "ip", host)
 	if err != nil {
 		return nil, err
 	}

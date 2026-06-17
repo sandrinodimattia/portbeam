@@ -2,9 +2,9 @@ GO ?= go
 BINARY ?= bin/portbeam
 VERSION ?= dev
 
-.PHONY: all fmt fmt-check vet test race bench build clean
+.PHONY: all fmt fmt-check vet test race coverage bench build clean
 
-all: fmt-check vet test build
+all: fmt-check vet coverage build
 
 fmt:
 	gofmt -w .
@@ -20,6 +20,14 @@ test:
 
 race:
 	$(GO) test -race ./...
+
+coverage:
+	$(GO) test -count=1 -coverprofile=coverage.out ./...
+	@total="$$( $(GO) tool cover -func=coverage.out | awk '/^total:/ { print $$3 }' )"; \
+	if [ "$$total" != "100.0%" ]; then \
+		echo "coverage $$total, want 100.0%"; \
+		exit 1; \
+	fi
 
 bench:
 	$(GO) test -bench=. -benchmem ./...

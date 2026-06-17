@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/netip"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -89,6 +92,180 @@ func TestResolveTCPAddrPortUnmapsIPv4MappedTarget(t *testing.T) {
 	}
 }
 
+func TestRunRejectsEmptySpecList(t *testing.T) {
+	t.Parallel()
+
+	if err := Run(context.Background(), nil, Options{}); err == nil {
+		t.Fatal("Run returned nil error for empty specs")
+	}
+}
+
+func TestRunReturnsNilWhenContextAlreadyCanceled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := Run(ctx, []Spec{{Listen: "127.0.0.1:10000", Target: "127.0.0.1:10001"}}, Options{})
+	if err != nil {
+		t.Fatalf("Run returned error for pre-canceled context: %v", err)
+	}
+}
+
+func TestRunReturnsResolveError(t *testing.T) {
+	t.Parallel()
+
+	err := Run(context.Background(), []Spec{{Listen: "127.0.0.1:10000", Target: "missing-port"}}, Options{})
+	if err == nil {
+		t.Fatal("Run returned nil error for unresolvable target")
+	}
+	if !strings.Contains(err.Error(), "resolve target") {
+		t.Fatalf("Run error %q does not include resolve context", err)
+	}
+}
+
+func TestRunClosesStartedListenersWhenListenFails(t *testing.T) {
+	firstListener := newStubListener(func() (net.Conn, error) {
+		return nil, errors.New("unexpected accept")
+	})
+	var calls int
+	withListenTCP(t, func(network string, address string) (net.Listener, error) {
+		calls++
+		if calls == 1 {
+			return firstListener, nil
+		}
+		return nil, errors.New("listen failed")
+	})
+
+	err := Run(context.Background(), []Spec{
+		{Listen: "127.0.0.1:10000", Target: "127.0.0.1:10001"},
+		{Listen: "127.0.0.1:10002", Target: "127.0.0.1:10003"},
+	}, Options{})
+	if err == nil {
+		t.Fatal("Run returned nil error when listen failed")
+	}
+	if !firstListener.closed() {
+		t.Fatal("Run did not close listener created before listen failure")
+	}
+}
+
+func TestRunReturnsListenerServeError(t *testing.T) {
+	listener := newStubListener(func() (net.Conn, error) {
+		return nil, errors.New("accept failed")
+	})
+	withListenTCP(t, func(network string, address string) (net.Listener, error) {
+		return listener, nil
+	})
+
+	err := Run(context.Background(), []Spec{{
+		Listen: "127.0.0.1:10000",
+		Target: "127.0.0.1:10001",
+	}}, Options{})
+	if err == nil {
+		t.Fatal("Run returned nil error when listener accept failed")
+	}
+	if !strings.Contains(err.Error(), "accept failed") {
+		t.Fatalf("Run error %q does not include accept failure", err)
+	}
+	if !listener.closed() {
+		t.Fatal("Run did not close listener after serve error")
+	}
+}
+
+func TestResolveSpecsWrapsTargetError(t *testing.T) {
+	t.Parallel()
+
+	_, err := resolveSpecs(context.Background(), []Spec{{Target: "missing-port"}})
+	if err == nil {
+		t.Fatal("resolveSpecs returned nil error for invalid target")
+	}
+	if !strings.Contains(err.Error(), "resolve target") {
+		t.Fatalf("resolveSpecs error %q does not include target context", err)
+	}
+}
+
+func TestResolveTCPAddrPortRejectsInvalidAddress(t *testing.T) {
+	t.Parallel()
+
+	if _, err := resolveTCPAddrPort(context.Background(), "missing-port"); err == nil {
+		t.Fatal("resolveTCPAddrPort returned nil error for invalid address")
+	}
+}
+
+func TestResolveTCPAddrPortsRejectsInvalidInputs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		address string
+	}{
+		{name: "missing port", address: "localhost"},
+		{name: "empty host", address: ":443"},
+		{name: "non-numeric port", address: "127.0.0.1:not-a-port"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := resolveTCPAddrPorts(context.Background(), test.address); err == nil {
+				t.Fatalf("resolveTCPAddrPorts(%q) returned nil error", test.address)
+			}
+		})
+	}
+}
+
+func TestResolveTCPAddrPortsHandlesLookupError(t *testing.T) {
+	withLookupIP(t, func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+		return nil, errors.New("lookup failed")
+	})
+
+	_, err := resolveTCPAddrPorts(context.Background(), "example.com:443")
+	if err == nil {
+		t.Fatal("resolveTCPAddrPorts returned nil error for lookup failure")
+	}
+	if !strings.Contains(err.Error(), "lookup failed") {
+		t.Fatalf("resolveTCPAddrPorts error %q does not include lookup failure", err)
+	}
+}
+
+func TestResolveTCPAddrPortsRejectsEmptyLookupResult(t *testing.T) {
+	withLookupIP(t, func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+		return nil, nil
+	})
+
+	_, err := resolveTCPAddrPorts(context.Background(), "example.com:443")
+	if err == nil {
+		t.Fatal("resolveTCPAddrPorts returned nil error for empty lookup result")
+	}
+	if !strings.Contains(err.Error(), "no IP addresses returned") {
+		t.Fatalf("resolveTCPAddrPorts error %q does not explain empty lookup result", err)
+	}
+}
+
+func TestResolveTCPAddrPortsDeduplicatesUnmappedAddresses(t *testing.T) {
+	withLookupIP(t, func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+		return []netip.Addr{
+			netip.MustParseAddr("127.0.0.1"),
+			netip.MustParseAddr("::ffff:127.0.0.1"),
+			netip.MustParseAddr("::1"),
+		}, nil
+	})
+
+	addrs, err := resolveTCPAddrPorts(context.Background(), "example.com:443")
+	if err != nil {
+		t.Fatalf("resolveTCPAddrPorts returned error: %v", err)
+	}
+
+	want := []netip.AddrPort{
+		netip.MustParseAddrPort("127.0.0.1:443"),
+		netip.MustParseAddrPort("[::1]:443"),
+	}
+	if !reflect.DeepEqual(addrs, want) {
+		t.Fatalf("resolved addresses mismatch\nwant: %#v\n got: %#v", want, addrs)
+	}
+}
+
 func TestDialTargetFallsBackToNextResolvedAddress(t *testing.T) {
 	target := startEchoServer(t)
 	targetAddr, err := netip.ParseAddrPort(target)
@@ -129,6 +306,49 @@ func TestDialTargetFallsBackToNextResolvedAddress(t *testing.T) {
 	}
 	if string(buf) != payload {
 		t.Fatalf("upstream response mismatch: %q", string(buf))
+	}
+}
+
+func TestDialTargetRejectsEmptyAddressList(t *testing.T) {
+	t.Parallel()
+
+	if _, _, err := dialTarget(context.Background(), resolvedSpec{}, normalizeOptions(Options{})); err == nil {
+		t.Fatal("dialTarget returned nil error for empty target address list")
+	}
+}
+
+func TestDialTargetReturnsCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := dialTarget(
+		ctx,
+		resolvedSpec{targetAddrs: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:1")}},
+		normalizeOptions(Options{}),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dialTarget error mismatch: want context.Canceled, got %v", err)
+	}
+}
+
+func TestDialTargetJoinsDialErrors(t *testing.T) {
+	unusedAddr, err := netip.ParseAddrPort(freeTCPAddress(t))
+	if err != nil {
+		t.Fatalf("parse unused address: %v", err)
+	}
+
+	_, _, err = dialTarget(
+		context.Background(),
+		resolvedSpec{targetAddrs: []netip.AddrPort{unusedAddr}},
+		normalizeOptions(Options{DialTimeout: 25 * time.Millisecond}),
+	)
+	if err == nil {
+		t.Fatal("dialTarget returned nil error for unreachable address")
+	}
+	if !strings.Contains(err.Error(), unusedAddr.String()) {
+		t.Fatalf("dialTarget error %q does not include target address", err)
 	}
 }
 
@@ -443,6 +663,114 @@ func TestRunClosesActiveConnectionsAfterShutdownTimeout(t *testing.T) {
 	}
 }
 
+func TestWaitForActiveConnectionsClosesImmediately(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+
+	tracker := newConnectionTracker()
+	_ = tracker.add(client)
+
+	var activeConnections sync.WaitGroup
+	waitForActiveConnections(
+		&activeConnections,
+		tracker,
+		normalizeOptions(Options{ShutdownTimeout: -1}),
+	)
+
+	_, err := peer.Write([]byte("closed"))
+	if err == nil {
+		t.Fatal("peer write unexpectedly succeeded after forced close")
+	}
+}
+
+func TestForwardConnectionLogsDialFailure(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+
+	unusedAddr, err := netip.ParseAddrPort(freeTCPAddress(t))
+	if err != nil {
+		t.Fatalf("parse unused address: %v", err)
+	}
+
+	var logs bytes.Buffer
+	forwardConnection(
+		context.Background(),
+		client,
+		resolvedSpec{
+			target:      "unreachable.test",
+			targetAddrs: []netip.AddrPort{unusedAddr},
+		},
+		normalizeOptions(Options{
+			DialTimeout: 25 * time.Millisecond,
+			Logger:      log.New(&logs, "", 0),
+		}),
+		newConnectionTracker(),
+	)
+
+	if !strings.Contains(logs.String(), "connect") {
+		t.Fatalf("forwardConnection logs %q do not include dial failure", logs.String())
+	}
+}
+
+func TestTuneTCPConnectionHandlesNonTCPAndDisabledKeepAlive(t *testing.T) {
+	client, peer := net.Pipe()
+	tuneTCPConnection(client, DefaultKeepAlive)
+	_ = client.Close()
+	_ = peer.Close()
+
+	target := startEchoServer(t)
+	conn := dialTCPWithRetry(t, target)
+	defer conn.Close()
+	tuneTCPConnection(conn, -1)
+}
+
+func TestCopyAndCloseWriteLogsCopyAndCloseErrors(t *testing.T) {
+	var logs bytes.Buffer
+	options := normalizeOptions(Options{
+		Logger: log.New(&logs, "", 0),
+	})
+	src := &errorConn{readErr: errors.New("read failed")}
+	dst := &errorConn{closeErr: errors.New("close failed")}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	copyAndCloseWrite(&wg, dst, src, options)
+	wg.Wait()
+
+	logText := logs.String()
+	if !strings.Contains(logText, "copy") {
+		t.Fatalf("copyAndCloseWrite logs %q do not include copy error", logText)
+	}
+	if !strings.Contains(logText, "close write") {
+		t.Fatalf("copyAndCloseWrite logs %q do not include close error", logText)
+	}
+}
+
+func TestIsClosedNetworkError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "broken pipe text", err: errors.New("write: broken pipe"), want: true},
+		{name: "unrelated", err: errors.New("other failure"), want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := isClosedNetworkError(test.err)
+			if got != test.want {
+				t.Fatalf("isClosedNetworkError(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+}
+
 func BenchmarkRunForwardsTCPThroughput(b *testing.B) {
 	target := startDiscardServer(b)
 	listen := freeTCPAddress(b)
@@ -710,4 +1038,95 @@ func dialTCPWithRetry(t testing.TB, address string) *net.TCPConn {
 	}
 	t.Fatalf("timed out dialing %s", address)
 	return nil
+}
+
+type stubListener struct {
+	mutex      sync.Mutex
+	accept     func() (net.Conn, error)
+	closeCount int
+}
+
+func newStubListener(accept func() (net.Conn, error)) *stubListener {
+	return &stubListener{accept: accept}
+}
+
+func (listener *stubListener) Accept() (net.Conn, error) {
+	return listener.accept()
+}
+
+func (listener *stubListener) Close() error {
+	listener.mutex.Lock()
+	listener.closeCount++
+	listener.mutex.Unlock()
+	return nil
+}
+
+func (listener *stubListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10000}
+}
+
+func (listener *stubListener) closed() bool {
+	listener.mutex.Lock()
+	defer listener.mutex.Unlock()
+	return listener.closeCount > 0
+}
+
+type errorConn struct {
+	readErr  error
+	closeErr error
+}
+
+func (conn *errorConn) Read(_ []byte) (int, error) {
+	return 0, conn.readErr
+}
+
+func (conn *errorConn) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (conn *errorConn) Close() error {
+	return conn.closeErr
+}
+
+func (conn *errorConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10001}
+}
+
+func (conn *errorConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 10002}
+}
+
+func (conn *errorConn) SetDeadline(_ time.Time) error {
+	return nil
+}
+
+func (conn *errorConn) SetReadDeadline(_ time.Time) error {
+	return nil
+}
+
+func (conn *errorConn) SetWriteDeadline(_ time.Time) error {
+	return nil
+}
+
+func withListenTCP(t testing.TB, replacement func(string, string) (net.Listener, error)) {
+	t.Helper()
+
+	original := listenTCP
+	listenTCP = replacement
+	t.Cleanup(func() {
+		listenTCP = original
+	})
+}
+
+func withLookupIP(
+	t testing.TB,
+	replacement func(context.Context, string, string) ([]netip.Addr, error),
+) {
+	t.Helper()
+
+	original := lookupIP
+	lookupIP = replacement
+	t.Cleanup(func() {
+		lookupIP = original
+	})
 }

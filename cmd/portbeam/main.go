@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -13,7 +14,11 @@ import (
 	"github.com/sandrino/portbeam"
 )
 
-var version = "dev"
+var (
+	version      = "dev"
+	exitProcess  = os.Exit
+	runForwarder = portbeam.Run
+)
 
 type forwardFlag []string
 
@@ -27,15 +32,15 @@ func (flags *forwardFlag) Set(value string) error {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:]))
+	exitProcess(run(os.Args[1:], os.Stderr))
 }
 
-func run(args []string) int {
+func run(args []string, output io.Writer) int {
 	var forwards forwardFlag
 	var showVersion bool
 
 	flags := flag.NewFlagSet("portbeam", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
+	flags.SetOutput(output)
 	shutdownTimeout := flags.Duration("shutdown-timeout", portbeam.DefaultShutdownTimeout, "maximum time to drain active connections after shutdown before closing them")
 	dialTimeout := flags.Duration("dial-timeout", portbeam.DefaultDialTimeout, "maximum time to establish each target connection")
 	keepAlive := flags.Duration("keepalive", portbeam.DefaultKeepAlive, "TCP keepalive period; set to a negative duration to disable")
@@ -60,8 +65,8 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	logger := log.New(os.Stderr, "", log.LstdFlags)
-	err = portbeam.Run(ctx, specs, portbeam.Options{
+	logger := log.New(output, "", log.LstdFlags)
+	err = runForwarder(ctx, specs, portbeam.Options{
 		ShutdownTimeout: *shutdownTimeout,
 		DialTimeout:     *dialTimeout,
 		KeepAlive:       *keepAlive,

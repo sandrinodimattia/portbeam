@@ -4,7 +4,7 @@ project_name: portbeam
 
 release:
   github:
-    owner: sandrino
+    owner: sandrinodimattia
     name: portbeam
 
 before:
