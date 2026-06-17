@@ -1,5 +1,9 @@
 # Portbeam
 
+<p align="center">
+  <img src="docs/assets/portbeam-hero.png" alt="Portbeam TCP port forwarding between two network interfaces" width="860">
+</p>
+
 Portbeam is a small, fast TCP port forwarder for exposing selected local or
 private services to another network interface.
 
