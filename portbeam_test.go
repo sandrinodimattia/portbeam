@@ -75,6 +75,63 @@ func TestResolveTCPAddrPortParsesLiteralTarget(t *testing.T) {
 	}
 }
 
+func TestResolveTCPAddrPortUnmapsIPv4MappedTarget(t *testing.T) {
+	t.Parallel()
+
+	addr, err := resolveTCPAddrPort(context.Background(), "[::ffff:127.0.0.1]:8443")
+	if err != nil {
+		t.Fatalf("resolveTCPAddrPort returned error: %v", err)
+	}
+
+	want := netip.MustParseAddrPort("127.0.0.1:8443")
+	if addr != want {
+		t.Fatalf("resolved address mismatch: want %s, got %s", want, addr)
+	}
+}
+
+func TestDialTargetFallsBackToNextResolvedAddress(t *testing.T) {
+	target := startEchoServer(t)
+	targetAddr, err := netip.ParseAddrPort(target)
+	if err != nil {
+		t.Fatalf("parse target address: %v", err)
+	}
+	unusedAddr, err := netip.ParseAddrPort(freeTCPAddress(t))
+	if err != nil {
+		t.Fatalf("parse unused address: %v", err)
+	}
+
+	upstream, dialedAddr, err := dialTarget(
+		context.Background(),
+		resolvedSpec{
+			target:      "fallback.test",
+			targetAddrs: []netip.AddrPort{unusedAddr, targetAddr},
+		},
+		normalizeOptions(Options{DialTimeout: 50 * time.Millisecond}),
+	)
+	if err != nil {
+		t.Fatalf("dial target: %v", err)
+	}
+	defer upstream.Close()
+	if dialedAddr != targetAddr {
+		t.Fatalf("dialed address mismatch: want %s, got %s", targetAddr, dialedAddr)
+	}
+
+	const payload = "fallback"
+	if _, err := upstream.Write([]byte(payload)); err != nil {
+		t.Fatalf("write upstream: %v", err)
+	}
+	if err := upstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set upstream read deadline: %v", err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(upstream, buf); err != nil {
+		t.Fatalf("read upstream echo: %v", err)
+	}
+	if string(buf) != payload {
+		t.Fatalf("upstream response mismatch: %q", string(buf))
+	}
+}
+
 func TestRunForwardsTCPConnections(t *testing.T) {
 	target := startEchoServer(t)
 	listen := freeTCPAddress(t)

@@ -67,9 +67,9 @@ type Options struct {
 }
 
 type resolvedSpec struct {
-	listen     string
-	target     string
-	targetAddr netip.AddrPort
+	listen      string
+	target      string
+	targetAddrs []netip.AddrPort
 }
 
 type normalizedOptions struct {
@@ -150,7 +150,7 @@ func Run(ctx context.Context, specs []Spec, options Options) error {
 		}
 
 		listeners = append(listeners, listener)
-		opts.logf("forwarding %s -> %s (%s)", spec.listen, spec.target, spec.targetAddr)
+		opts.logf("forwarding %s -> %s (%v)", spec.listen, spec.target, spec.targetAddrs)
 	}
 
 	go func() {
@@ -220,50 +220,72 @@ func (options normalizedOptions) logf(format string, args ...any) {
 func resolveSpecs(ctx context.Context, specs []Spec) ([]resolvedSpec, error) {
 	resolvedSpecs := make([]resolvedSpec, 0, len(specs))
 	for _, spec := range specs {
-		targetAddr, err := resolveTCPAddrPort(ctx, spec.Target)
+		targetAddrs, err := resolveTCPAddrPorts(ctx, spec.Target)
 		if err != nil {
 			return nil, fmt.Errorf("resolve target %s: %w", spec.Target, err)
 		}
 		resolvedSpecs = append(resolvedSpecs, resolvedSpec{
-			listen:     spec.Listen,
-			target:     spec.Target,
-			targetAddr: targetAddr,
+			listen:      spec.Listen,
+			target:      spec.Target,
+			targetAddrs: targetAddrs,
 		})
 	}
 	return resolvedSpecs, nil
 }
 
 func resolveTCPAddrPort(ctx context.Context, address string) (netip.AddrPort, error) {
-	host, portText, err := net.SplitHostPort(address)
+	addrs, err := resolveTCPAddrPorts(ctx, address)
 	if err != nil {
 		return netip.AddrPort{}, err
 	}
+	return addrs[0], nil
+}
+
+func resolveTCPAddrPorts(ctx context.Context, address string) ([]netip.AddrPort, error) {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
 	if host == "" {
-		return netip.AddrPort{}, errors.New("target host must be non-empty")
+		return nil, errors.New("target host must be non-empty")
 	}
 
 	port, err := strconv.ParseUint(portText, 10, 16)
 	if err != nil {
-		return netip.AddrPort{}, fmt.Errorf("target port %q must be numeric: %w", portText, err)
+		return nil, fmt.Errorf("target port %q must be numeric: %w", portText, err)
 	}
+	targetPort := uint16(port)
 
 	if addr, err := netip.ParseAddr(host); err == nil {
-		return netip.AddrPortFrom(addr, uint16(port)), nil
+		return []netip.AddrPort{netip.AddrPortFrom(addr.Unmap(), targetPort)}, nil
 	}
 
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
-		return netip.AddrPort{}, err
+		return nil, err
 	}
 	if len(addrs) == 0 {
-		return netip.AddrPort{}, errors.New("no IP addresses returned")
+		return nil, errors.New("no IP addresses returned")
 	}
-	for _, addr := range addrs {
-		if addr.Is4() {
-			return netip.AddrPortFrom(addr, uint16(port)), nil
+
+	targetAddrs := make([]netip.AddrPort, 0, len(addrs))
+	seen := make(map[netip.Addr]struct{}, len(addrs))
+	appendAddrs := func(wantIPv4 bool) {
+		for _, addr := range addrs {
+			addr = addr.Unmap()
+			if addr.Is4() != wantIPv4 {
+				continue
+			}
+			if _, ok := seen[addr]; ok {
+				continue
+			}
+			seen[addr] = struct{}{}
+			targetAddrs = append(targetAddrs, netip.AddrPortFrom(addr, targetPort))
 		}
 	}
-	return netip.AddrPortFrom(addrs[0], uint16(port)), nil
+	appendAddrs(true)
+	appendAddrs(false)
+	return targetAddrs, nil
 }
 
 func closeListeners(listeners []net.Listener) {
@@ -389,13 +411,9 @@ func forwardConnection(
 	defer client.Close()
 	tuneTCPConnection(client, options.keepAlive)
 
-	dialer := net.Dialer{
-		Timeout:   options.dialTimeout,
-		KeepAlive: options.keepAlive,
-	}
-	upstream, err := dialer.DialTCP(ctx, "tcp", netip.AddrPort{}, spec.targetAddr)
+	upstream, _, err := dialTarget(ctx, spec, options)
 	if err != nil {
-		options.logf("connect %s -> %s (%s) failed: %v", client.RemoteAddr(), spec.target, spec.targetAddr, err)
+		options.logf("connect %s -> %s (%v) failed: %v", client.RemoteAddr(), spec.target, spec.targetAddrs, err)
 		return
 	}
 	removeUpstream := tracker.add(upstream)
@@ -408,6 +426,31 @@ func forwardConnection(
 	go copyAndCloseWrite(&wg, upstream, client, options)
 	go copyAndCloseWrite(&wg, client, upstream, options)
 	wg.Wait()
+}
+
+func dialTarget(ctx context.Context, spec resolvedSpec, options normalizedOptions) (*net.TCPConn, netip.AddrPort, error) {
+	if len(spec.targetAddrs) == 0 {
+		return nil, netip.AddrPort{}, errors.New("no target addresses")
+	}
+
+	dialer := net.Dialer{
+		Timeout:   options.dialTimeout,
+		KeepAlive: options.keepAlive,
+	}
+
+	var errs []error
+	for _, targetAddr := range spec.targetAddrs {
+		upstream, err := dialer.DialTCP(ctx, "tcp", netip.AddrPort{}, targetAddr)
+		if err == nil {
+			return upstream, targetAddr, nil
+		}
+		if ctx.Err() != nil {
+			return nil, netip.AddrPort{}, ctx.Err()
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", targetAddr, err))
+	}
+
+	return nil, netip.AddrPort{}, errors.Join(errs...)
 }
 
 func tuneTCPConnection(conn net.Conn, keepAlive time.Duration) {
